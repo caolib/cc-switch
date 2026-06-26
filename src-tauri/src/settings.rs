@@ -357,6 +357,11 @@ pub struct AppSettings {
     /// 静默启动（程序启动时不显示主窗口，仅托盘运行）
     #[serde(default)]
     pub silent_startup: bool,
+    /// 隐藏到托盘后延迟进入轻量模式（销毁 WebView 释放内存）的秒数。
+    /// 0 表示立即进入，-1 表示从不自动进入，默认 60 秒。
+    /// 在此期间若重新显示窗口则取消延迟。
+    #[serde(default = "default_lightweight_delay")]
+    pub lightweight_delay_seconds: i64,
     /// 是否在主页面启用本地代理功能（默认关闭）
     #[serde(default)]
     pub enable_local_proxy: bool,
@@ -488,6 +493,10 @@ fn default_minimize_to_tray_on_close() -> bool {
     true
 }
 
+fn default_lightweight_delay() -> i64 {
+    60
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -498,6 +507,7 @@ impl Default for AppSettings {
             skip_claude_onboarding: false,
             launch_on_startup: false,
             silent_startup: false,
+            lightweight_delay_seconds: 60i64,
             enable_local_proxy: false,
             proxy_confirmed: None,
             usage_confirmed: None,

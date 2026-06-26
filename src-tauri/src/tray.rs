@@ -704,6 +704,9 @@ pub fn handle_tray_menu_event(app: &tauri::AppHandle, event_id: &str) {
 
     match event_id {
         "show_main" => {
+            // 取消挂起的轻量模式延迟计时器
+            crate::lightweight::cancel_pending_lightweight();
+
             if let Some(window) = app.get_webview_window("main") {
                 #[cfg(target_os = "windows")]
                 {

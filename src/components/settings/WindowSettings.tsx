@@ -1,6 +1,6 @@
 import { useTranslation } from "react-i18next";
 import type { SettingsFormState } from "@/hooks/useSettings";
-import { AppWindow, MonitorUp, Power, EyeOff } from "lucide-react";
+import { AppWindow, MonitorUp, Power, EyeOff, Timer } from "lucide-react";
 import { ToggleRow } from "@/components/ui/toggle-row";
 import { AnimatePresence, motion } from "framer-motion";
 import { isLinux } from "@/lib/platform";
@@ -76,6 +76,46 @@ export function WindowSettings({ settings, onChange }: WindowSettingsProps) {
             onChange({ minimizeToTrayOnClose: value })
           }
         />
+
+        <AnimatePresence initial={false}>
+          {settings.minimizeToTrayOnClose && (
+            <motion.div
+              key="lightweight-delay"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 10 }}
+              transition={{ duration: 0.3 }}
+            >
+              <div className="flex items-center justify-between px-4 py-3 rounded-lg border border-border/50 bg-muted/30">
+                <div className="flex items-center gap-3 min-w-0">
+                  <Timer className="h-4 w-4 text-rose-500 shrink-0" />
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium">{t("settings.lightweightDelay")}</p>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      {t("settings.lightweightDelayDescription")}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-1 shrink-0 ml-3">
+                  <input
+                    type="number"
+                    min={-1}
+                    max={3600}
+                    value={settings.lightweightDelaySeconds ?? 60}
+                    onChange={(e) => {
+                      const val = parseInt(e.target.value, 10);
+                      onChange({ lightweightDelaySeconds: isNaN(val) ? -1 : val });
+                    }}
+                    className="w-16 h-8 text-center text-sm rounded-md border border-border/60 bg-background focus:outline-none focus:ring-1 focus:ring-primary/40 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                  />
+                  <span className="text-xs text-muted-foreground">
+                    {settings.lightweightDelaySeconds === -1 ? t("settings.off") : t("settings.seconds")}
+                  </span>
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {isLinux() && (
           <ToggleRow

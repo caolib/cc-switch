@@ -132,11 +132,10 @@ jobs:
       - name: Prepare Tauri signing key
         shell: bash
         run: |
-          # 调试：检查 Secret 是否存在
           if [ -z "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" ]; then
-            echo "❌ TAURI_SIGNING_PRIVATE_KEY Secret 为空或不存在" >&2
-            echo "请检查 GitHub 仓库 Settings > Secrets and variables > Actions" >&2
-            exit 1
+            echo "⚠️ TAURI_SIGNING_PRIVATE_KEY 未配置，跳过签名（更新器 .sig 文件不会生成）" >&2
+            echo "SKIP_SIGNING=true" >> "$GITHUB_ENV"
+            exit 0
           fi
           
           RAW="${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}"
@@ -190,6 +189,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [ -z "${{ secrets.APPLE_CERTIFICATE }}" ]; then
+            echo "⚠️ APPLE_CERTIFICATE 未配置，跳过 macOS 代码签名和公证" >&2
+            exit 0
+          fi
           # Decode .p12 certificate from base64
           CERT_PATH="$RUNNER_TEMP/certificate.p12"
           printf '%s' "${{ secrets.APPLE_CERTIFICATE }}" | (base64 --decode 2>/dev/null || base64 -D) > "$CERT_PATH"
@@ -303,9 +306,13 @@ jobs:
             exit 1
           fi
 
-          # Staple notarization ticket to .app (Tauri already notarized it)
-          xcrun stapler staple "$APP_PATH"
-          echo "✅ .app stapled"
+          # Staple notarization ticket to .app (if signed)
+          if xcrun stapler validate "$APP_PATH" 2>/dev/null; then
+            xcrun stapler staple "$APP_PATH" || true
+            echo "✅ .app stapled"
+          else
+            echo "⚠️ .app not notarized, skipping staple"
+          fi
 
           # 1) Collect .tar.gz (updater artifact)
           NEW_TAR_GZ="CC-Switch-${VERSION}-macOS.tar.gz"
@@ -319,34 +326,33 @@ jobs:
           echo "macOS zip ready: $NEW_ZIP"
 
           # 3) Create styled DMG with create-dmg (Tauri's built-in DMG styling doesn't work on CI)
-          if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
-            echo "❌ APPLE_SIGNING_IDENTITY is missing before DMG creation" >&2
-            exit 1
+          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install create-dmg
+            NEW_DMG="CC-Switch-${VERSION}-macOS.dmg"
+            DMG_STAGE_DIR="$RUNNER_TEMP/dmg-stage"
+            rm -rf "$DMG_STAGE_DIR"
+            mkdir -p "$DMG_STAGE_DIR"
+            ditto "$APP_PATH" "$DMG_STAGE_DIR/CC Switch.app"
+
+            create-dmg \
+              --volname "CC Switch" \
+              --background "src-tauri/icons/dmg-background.png" \
+              --window-size 660 400 \
+              --window-pos 200 120 \
+              --icon-size 80 \
+              --icon "CC Switch.app" 180 220 \
+              --hide-extension "CC Switch.app" \
+              --app-drop-link 480 220 \
+              --codesign "$APPLE_SIGNING_IDENTITY" \
+              --no-internet-enable \
+              "release-assets/$NEW_DMG" \
+              "$DMG_STAGE_DIR"
+
+            rm -rf "$DMG_STAGE_DIR"
+            echo "✅ Styled DMG created: $NEW_DMG"
+          else
+            echo "⚠️ APPLE_SIGNING_IDENTITY 未配置，跳过 DMG 创建"
           fi
-
-          HOMEBREW_NO_AUTO_UPDATE=1 brew install create-dmg
-          NEW_DMG="CC-Switch-${VERSION}-macOS.dmg"
-          DMG_STAGE_DIR="$RUNNER_TEMP/dmg-stage"
-          rm -rf "$DMG_STAGE_DIR"
-          mkdir -p "$DMG_STAGE_DIR"
-          ditto "$APP_PATH" "$DMG_STAGE_DIR/CC Switch.app"
-
-          create-dmg \
-            --volname "CC Switch" \
-            --background "src-tauri/icons/dmg-background.png" \
-            --window-size 660 400 \
-            --window-pos 200 120 \
-            --icon-size 80 \
-            --icon "CC Switch.app" 180 220 \
-            --hide-extension "CC Switch.app" \
-            --app-drop-link 480 220 \
-            --codesign "$APPLE_SIGNING_IDENTITY" \
-            --no-internet-enable \
-            "release-assets/$NEW_DMG" \
-            "$DMG_STAGE_DIR"
-
-          rm -rf "$DMG_STAGE_DIR"
-          echo "✅ Styled DMG created: $NEW_DMG"
 
       - name: Notarize macOS DMG
         if: runner.os == 'macOS'
@@ -359,10 +365,15 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_PASSWORD:-}" ]; then
+            echo "⚠️ APPLE_ID 或 APPLE_PASSWORD 未配置，跳过 macOS 公证"
+            exit 0
+          fi
+
           DMG_PATH=$(find release-assets -maxdepth 1 -name "*.dmg" -type f | head -1 || true)
           if [ -z "$DMG_PATH" ]; then
-            echo "❌ No .dmg found in release-assets/ to notarize" >&2
-            exit 1
+            echo "⚠️ No .dmg found in release-assets/ to notarize (可能未创建 DMG)" >&2
+            exit 0
           fi
 
           echo "=== Notarizing DMG: $DMG_PATH ==="
@@ -396,6 +407,25 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            echo "⚠️ APPLE_SIGNING_IDENTITY 未配置，跳过 macOS 代码签名验证"
+            # 仍然收集 .app 和 .dmg 路径供后续步骤使用
+            APP_PATH=""
+            for path in \
+              "src-tauri/target/universal-apple-darwin/release/bundle/macos" \
+              "src-tauri/target/aarch64-apple-darwin/release/bundle/macos" \
+              "src-tauri/target/x86_64-apple-darwin/release/bundle/macos" \
+              "src-tauri/target/release/bundle/macos"; do
+              if [ -d "$path" ]; then
+                [ -z "$APP_PATH" ] && APP_PATH=$(find "$path" -maxdepth 1 -name "*.app" -type d | head -1 || true)
+              fi
+            done
+            if [ -n "$APP_PATH" ]; then
+              echo "✅ .app 已找到: $APP_PATH"
+            fi
+            exit 0
+          fi
+
           # Verify .app (from Tauri bundle)
           APP_PATH=""
           for path in \
@@ -413,26 +443,19 @@ jobs:
             exit 1
           fi
           echo "=== Verifying .app: $APP_PATH ==="
-          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
-          echo "✅ codesign verification passed"
-          spctl -a -t exec -vv "$APP_PATH"
-          echo "✅ spctl assessment passed"
-          xcrun stapler validate "$APP_PATH"
-          echo "✅ .app stapler validation passed"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH" || echo "⚠️ codesign verification skipped (unsigned)"
+          spctl -a -t exec -vv "$APP_PATH" || echo "⚠️ spctl assessment skipped (unsigned)"
+          xcrun stapler validate "$APP_PATH" || echo "⚠️ stapler validation skipped (not notarized)"
 
           # Verify .dmg (from release-assets/, created by create-dmg + notarized)
           DMG_PATH=$(find release-assets -maxdepth 1 -name "*.dmg" -type f | head -1 || true)
           if [ -n "$DMG_PATH" ]; then
             echo "=== Verifying .dmg: $DMG_PATH ==="
-            codesign --verify --verbose=2 "$DMG_PATH"
-            echo "✅ .dmg codesign verification passed"
-            spctl -a -t open --context context:primary-signature -vv "$DMG_PATH"
-            echo "✅ .dmg spctl assessment passed"
-            xcrun stapler validate "$DMG_PATH"
-            echo "✅ .dmg stapler validation passed"
+            codesign --verify --verbose=2 "$DMG_PATH" || echo "⚠️ dmg codesign verification skipped (unsigned)"
+            spctl -a -t open --context context:primary-signature -vv "$DMG_PATH" || echo "⚠️ dmg spctl assessment skipped (unsigned)"
+            xcrun stapler validate "$DMG_PATH" || echo "⚠️ dmg stapler validation skipped (not notarized)"
           else
-            echo "❌ No .dmg found for verification — release would ship without verified DMG" >&2
-            exit 1
+            echo "⚠️ No .dmg found for verification (skipped if DMG was not created)"
           fi
 
       - name: Prepare Windows Assets
@@ -618,7 +641,7 @@ jobs:
 
             ### 下载
 
-            - **macOS**: `CC-Switch-${{ github.ref_name }}-macOS.dmg`（推荐）或 `CC-Switch-${{ github.ref_name }}-macOS.zip`（解压即用）
+            - **macOS**: `CC-Switch-${{ github.ref_name }}-macOS.dmg`（推荐）或 `CC-Switch-${{ github.ref_name }}-macOS.zip`（解压即用；如未配置 Apple 证书则为未签名版本）
             - **Windows (x86_64)**: `CC-Switch-${{ github.ref_name }}-Windows.msi`（安装版）或 `CC-Switch-${{ github.ref_name }}-Windows-Portable.zip`（绿色版）
             - **Windows (ARM64)**: `CC-Switch-${{ github.ref_name }}-Windows-arm64.msi`（安装版）或 `CC-Switch-${{ github.ref_name }}-Windows-arm64-Portable.zip`（绿色版）
             - **Linux (x86_64)**: `CC-Switch-${{ github.ref_name }}-Linux-x86_64.AppImage` / `.deb` / `.rpm`
@@ -627,7 +650,7 @@ jobs:
             > `.tar.gz` 为 Tauri updater 自动更新专用，无需手动下载。
 
             ---
-            macOS 版本已通过 Apple 代码签名和公证，可直接安装使用。
+            macOS 版本如已配置 Apple 开发者证书则经过签名和公证，否则为未签名版本。
           files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

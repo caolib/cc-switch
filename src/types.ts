@@ -344,6 +344,8 @@ export interface Settings {
   launchOnStartup?: boolean;
   // 静默启动（程序启动时不显示主窗口）
   silentStartup?: boolean;
+  // 隐藏到托盘后延迟进入轻量模式（销毁 WebView 释放内存）的秒数，0 表示立即
+  lightweightDelaySeconds?: number;
   // 是否启用主页面本地代理功能（默认关闭）
   enableLocalProxy?: boolean;
   // User has confirmed the local proxy first-run notice

@@ -1,8 +1,69 @@
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
 
+use once_cell::sync::Lazy;
 use tauri::Manager;
+use tokio::sync::oneshot;
 
 static LIGHTWEIGHT_MODE: AtomicBool = AtomicBool::new(false);
+
+/// 进入轻量模式延迟计时器的取消通道。
+/// 隐藏窗口时启动计时器，指定秒数后自动销毁 WebView 释放内存。
+/// 在此期间若重新显示窗口则取消计时器。
+static HIDE_TIMER_CANCEL: Lazy<Mutex<Option<oneshot::Sender<()>>>> =
+    Lazy::new(|| Mutex::new(None));
+
+/// 取消挂起的轻量模式延迟计时器（例如窗口被重新显示时调用）
+pub fn cancel_pending_lightweight() {
+    if let Some(sender) = HIDE_TIMER_CANCEL.lock().unwrap().take() {
+        let _ = sender.send(());
+        log::info!("已取消轻量模式延迟计时器");
+    }
+}
+
+/// 安排延迟进入轻量模式。
+/// - `-1`：不进入轻量模式（仅隐藏窗口）
+/// - `0`：立即进入
+/// - `>0`：延迟指定秒数后进入
+/// 若已有挂起的计时器，先取消旧计时器。
+pub fn schedule_enter_lightweight(app: &tauri::AppHandle, delay_seconds: i64) {
+    // 先取消旧的计时器
+    cancel_pending_lightweight();
+
+    if delay_seconds < 0 {
+        // -1 表示不进入轻量模式，仅隐藏窗口
+        log::info!("轻量模式已禁用（delay={}），仅隐藏窗口", delay_seconds);
+        return;
+    }
+
+    if delay_seconds == 0 {
+        // 立即进入
+        if let Err(e) = enter_lightweight_mode(app) {
+            log::error!("进入轻量模式失败: {e}");
+        }
+        return;
+    }
+
+    let (tx, rx) = oneshot::channel();
+    *HIDE_TIMER_CANCEL.lock().unwrap() = Some(tx);
+
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::select! {
+            _ = rx => {
+                // 计时器被取消（窗口重新显示）
+            }
+            _ = tokio::time::sleep(Duration::from_secs(delay_seconds as u64)) => {
+                // 计时到期，进入轻量模式
+                log::info!("隐藏计时到期（{} 秒），进入轻量模式释放 WebView 内存", delay_seconds);
+                let _ = enter_lightweight_mode(&app);
+            }
+        }
+    });
+
+    log::info!("已安排 {} 秒后进入轻量模式", delay_seconds);
+}
 
 pub fn enter_lightweight_mode(app: &tauri::AppHandle) -> Result<(), String> {
     #[cfg(target_os = "windows")]
@@ -31,6 +92,9 @@ pub fn enter_lightweight_mode(app: &tauri::AppHandle) -> Result<(), String> {
 }
 
 pub fn exit_lightweight_mode(app: &tauri::AppHandle) -> Result<(), String> {
+    // 退出轻量模式前确保取消挂起的延迟计时器
+    cancel_pending_lightweight();
+
     use tauri::WebviewWindowBuilder;
 
     if let Some(window) = app.get_webview_window("main") {

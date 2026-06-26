@@ -64,7 +64,7 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use tauri::image::Image;
-use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::RunEvent;
 use tauri::{Emitter, Manager};
 use tauri_plugin_window_state::{AppHandleExt, StateFlags};
@@ -251,6 +251,9 @@ pub fn run() {
                 log::info!("ℹ No deep link URL found in args (this is expected on macOS when launched via system)");
             }
 
+            // 取消挂起的轻量模式延迟计时器
+            crate::lightweight::cancel_pending_lightweight();
+
             // Show and focus window regardless
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
@@ -284,14 +287,20 @@ pub fn run() {
 
                 if settings.minimize_to_tray_on_close {
                     api.prevent_close();
-                    let _ = window.hide();
+                    // 按设置的延迟销毁 WebView 释放内存，仅保留托盘后台服务
+                    let app_handle = window.app_handle();
+                    let delay = settings.lightweight_delay_seconds;
+                    crate::lightweight::schedule_enter_lightweight(app_handle, delay);
                     #[cfg(target_os = "windows")]
                     {
                         let _ = window.set_skip_taskbar(true);
                     }
                     #[cfg(target_os = "macos")]
                     {
-                        tray::apply_tray_policy(window.app_handle(), false);
+                        tray::apply_tray_policy(app_handle, false);
+                    }
+                    if delay != 0 {
+                        let _ = window.hide();
                     }
                 } else {
                     api.prevent_close();
@@ -897,9 +906,21 @@ pub fn run() {
             let mut tray_builder = TrayIconBuilder::with_id(tray::TRAY_ID)
                 .tooltip("CC Switch") // 鼠标悬停提示
                 .on_tray_icon_event(|tray, event| match event {
-                    // 鼠标悬停/点击到托盘图标时，后台异步刷新用量缓存，
-                    // 让用户下一次（或快速打开菜单的那一刻）看到较新的数字。
-                    // refresh_all_usage_in_tray 内部有 10 秒防抖。
+                    // 左键单击切换主界面显示/隐藏，同时后台刷新用量缓存
+                    // 仅处理左键 Up（松开），避免 Down+Up 重复触发导致显示后又隐藏
+                    TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } => {
+                        toggle_main_window(tray.app_handle());
+                        let app = tray.app_handle().clone();
+                        tauri::async_runtime::spawn(async move {
+                            crate::tray::refresh_all_usage_in_tray(&app).await;
+                        });
+                    }
+                    // 鼠标悬停或非左键点击时，后台异步刷新用量缓存，
+                    // 让用户打开菜单时看到较新数字（refresh_all_usage_in_tray 内部有 10 秒防抖）。
                     TrayIconEvent::Enter { .. } | TrayIconEvent::Click { .. } => {
                         let app = tray.app_handle().clone();
                         tauri::async_runtime::spawn(async move {
@@ -912,7 +933,7 @@ pub fn run() {
                 .on_menu_event(|app, event| {
                     tray::handle_tray_menu_event(app, &event.id.0);
                 })
-                .show_menu_on_left_click(true);
+                .show_menu_on_left_click(false);
 
             // 使用平台对应的托盘图标（macOS 使用模板图标适配深浅色）
             #[cfg(target_os = "macos")]
@@ -1566,6 +1587,9 @@ pub fn run() {
             match event {
                 // macOS 在 Dock 图标被点击并重新激活应用时会触发 Reopen 事件，这里手动恢复主窗口
                 RunEvent::Reopen { .. } => {
+                    // 取消挂起的轻量模式延迟计时器
+                    crate::lightweight::cancel_pending_lightweight();
+
                     if let Some(window) = app_handle.get_webview_window("main") {
                         #[cfg(target_os = "windows")]
                         {
@@ -2003,6 +2027,52 @@ fn classify_exit_request(code: Option<i32>) -> ExitRequestAction {
         None => ExitRequestAction::StayInTray,
         Some(tauri::RESTART_EXIT_CODE) => ExitRequestAction::DeferToTauriRestart,
         Some(_) => ExitRequestAction::CleanupAndExit,
+    }
+}
+
+// ============================================================
+// 托盘左键单击：切换主界面显示/隐藏
+// ============================================================
+
+fn toggle_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        match window.is_visible() {
+            Ok(true) => {
+                // 窗口可见 → 按设置的延迟后销毁 WebView 释放内存
+                log::info!("托盘左键：隐藏主界面");
+                let delay = crate::settings::get_settings().lightweight_delay_seconds;
+                crate::lightweight::schedule_enter_lightweight(app, delay);
+                #[cfg(target_os = "windows")]
+                let _ = window.set_skip_taskbar(true);
+                #[cfg(target_os = "macos")]
+                crate::tray::apply_tray_policy(app, false);
+                if delay == 0 {
+                    // delay=0 时 schedule_enter_lightweight 已同步销毁窗口
+                } else {
+                    let _ = window.hide();
+                }
+            }
+            _ => {
+                // 窗口不可见 → 取消延迟计时器，显示并聚焦
+                log::info!("托盘左键：显示主界面");
+                crate::lightweight::cancel_pending_lightweight();
+                #[cfg(target_os = "windows")]
+                let _ = window.set_skip_taskbar(false);
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+                #[cfg(target_os = "linux")]
+                crate::linux_fix::nudge_main_window(window.clone());
+                #[cfg(target_os = "macos")]
+                crate::tray::apply_tray_policy(app, true);
+            }
+        }
+    } else if crate::lightweight::is_lightweight_mode() {
+        // 窗口已被销毁 → 重建
+        log::info!("托盘左键：重建主界面");
+        if let Err(e) = crate::lightweight::exit_lightweight_mode(app) {
+            log::error!("重建主界面失败: {e}");
+        }
     }
 }
 
